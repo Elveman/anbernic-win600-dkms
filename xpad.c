@@ -69,6 +69,8 @@
 #include <linux/module.h>
 #include <linux/usb/input.h>
 #include <linux/usb/quirks.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
 
 #define XPAD_PKT_LEN 64
 
@@ -1740,22 +1742,206 @@ err_free_input:
 
 #include <asm/io.h>
 
+/* elveman */
+extern unsigned long volatile jiffies;
+
+#define PS2_KBD_PORT (0x60)
+#define SCANCODE_KEY_WIN (0x5B)
+#define SCANCODE_KEY_G (0x22) // Xbox Game Bar
+#define SCANCODE_KEY_LCTL (0x1D) // On-Screen Keyboard
+#define SCANCODE_KEY_O (0x18) // On-Screen Keyboard
+#define SCANCODE_KEY_RELEASED (0x80) // On-Screen Keyboard
+
+#define SCANCODE_KEY_WIN_MSK (0x01)
+#define SCANCODE_KEY_G_MSK (0x02)
+#define SCANCODE_KEY_LCTL_MSK (0x02)
+#define SCANCODE_KEY_O_MSK (0x04)
+
+#define SCANCODE_BTN_HOME_MSK (SCANCODE_KEY_WIN_MSK | SCANCODE_KEY_G_MSK)
+#define SCANCODE_BTN_KBD_MSK (SCANCODE_KEY_WIN_MSK | SCANCODE_KEY_LCTL_MSK | SCANCODE_KEY_O_MSK)
+
+#define BTN_TIMER_TIMEOUT_MS (250)
+
+static volatile uint8_t home_btn_state = 0;
+static volatile uint8_t kbd_btn_state = 0;
+
+static struct timer_list timer_home;
+static struct timer_list timer_kbd_x;
+static struct timer_list timer_kbd_home;
+static struct timer_list timer_kbd_cpl;
+
+volatile static bool timer_home_running = false; // int timer_pending(const struct timer_list * timer);
+volatile static bool timer_kbd_running = false;
+
+DEFINE_SPINLOCK(home_btn_lock);
+DEFINE_SPINLOCK(kbd_btn_lock);
 DEFINE_SPINLOCK(scan_lock);
-static irqreturn_t win_key_irq_handler(int irg, void *dev_id)
+
+void handle_timeout_home(struct timer_list *t) // Release the home button if it was invoked. If not, clear the state variables
+{
+    if (!((home_btn_state & SCANCODE_BTN_HOME_MSK) == SCANCODE_BTN_HOME_MSK))
+    {
+        spin_lock(&home_btn_lock);
+        home_btn_state = 0;
+        timer_home_running = false;
+        spin_unlock(&home_btn_lock);
+        return;
+    }
+    input_report_key(win_key_xpad->dev, BTN_MODE, 0);
+    input_sync(win_key_xpad->dev);
+    spin_lock(&home_btn_lock);
+    home_btn_state = 0;
+    timer_home_running = false;
+    spin_unlock(&home_btn_lock);
+}
+
+void handle_timeout_kbd_cpl(struct timer_list *t) // x -> home -> cpl
+{
+    printk("X released\n");
+    input_report_key(win_key_xpad->dev, BTN_X, 0);
+    input_sync(win_key_xpad->dev);
+    spin_lock(&kbd_btn_lock);
+    kbd_btn_state = 0;
+    timer_kbd_running = false;
+    spin_unlock(&kbd_btn_lock);
+}
+
+
+void handle_timeout_kbd_home(struct timer_list *t)
+{
+    printk("Home released\n");
+    input_report_key(win_key_xpad->dev, BTN_X, 1);
+    input_report_key(win_key_xpad->dev, BTN_MODE, 0);
+    input_sync(win_key_xpad->dev);
+    timer_setup(&timer_kbd_cpl, handle_timeout_kbd_cpl, 0);
+    mod_timer(&timer_kbd_cpl, jiffies + msecs_to_jiffies(BTN_TIMER_TIMEOUT_MS));
+}
+
+void handle_timeout_kbd_x(struct timer_list *t) // If the specific combo wasn't pressed, clear state variables and return
+{
+    if (!((kbd_btn_state & SCANCODE_BTN_KBD_MSK) == SCANCODE_BTN_KBD_MSK))
+    {
+        spin_lock(&kbd_btn_lock);
+        kbd_btn_state = 0;
+        timer_kbd_running = false;
+        spin_unlock(&kbd_btn_lock);
+        return;
+    }
+    printk("Home pressed\n");
+    input_report_key(win_key_xpad->dev, BTN_X, 1);
+    input_report_key(win_key_xpad->dev, BTN_MODE, 1);
+    input_sync(win_key_xpad->dev);
+    timer_setup(&timer_kbd_home, handle_timeout_kbd_home, 0);
+    mod_timer(&timer_kbd_home, jiffies + msecs_to_jiffies(BTN_TIMER_TIMEOUT_MS));
+}
+
+static irqreturn_t win_key_irq_handler(int irq, void *dev_id) // Check for Win + G combo *pressed* or Win + Ctrl + O combo *released*
 {
     spin_lock(&scan_lock);
-    int scancode = inb(0x60);
+    int scancode = inb(PS2_KBD_PORT);
     spin_unlock(&scan_lock);
-	 if(scancode == 91){
-	 	//printk(KERN_INFO"key 1\n",scancode);
-		input_report_key(win_key_xpad->dev, BTN_MODE,	1);input_sync(win_key_xpad->dev);
-	 }else if(scancode == 219){
-		//printk(KERN_INFO"key 0\n",scancode);
-		input_report_key(win_key_xpad->dev, BTN_MODE,	0);input_sync(win_key_xpad->dev);
-	}
-    
+    printk("scancode: %d\n", scancode);
+    if (scancode == SCANCODE_KEY_WIN)
+    {
+        spin_lock(&home_btn_lock);
+        home_btn_state |= SCANCODE_KEY_WIN_MSK;
+        spin_unlock(&home_btn_lock);
+
+        if ((home_btn_state & SCANCODE_BTN_HOME_MSK) == SCANCODE_BTN_HOME_MSK)
+        {
+            input_report_key(win_key_xpad->dev, BTN_MODE, 1);
+            input_sync(win_key_xpad->dev);
+        }
+        if (!timer_home_running)
+        {
+            timer_setup(&timer_home, handle_timeout_home, 0);
+            mod_timer(&timer_home, jiffies + msecs_to_jiffies(BTN_TIMER_TIMEOUT_MS));
+            spin_lock(&home_btn_lock);
+            timer_home_running = true;
+            spin_unlock(&home_btn_lock);
+        }
+    } else if (scancode == SCANCODE_KEY_G)
+    {
+        spin_lock(&home_btn_lock);
+        home_btn_state |= SCANCODE_KEY_G_MSK;
+        spin_unlock(&home_btn_lock);
+
+        if ((home_btn_state & SCANCODE_BTN_HOME_MSK) == SCANCODE_BTN_HOME_MSK)
+        {
+            input_report_key(win_key_xpad->dev, BTN_MODE, 1);
+            input_sync(win_key_xpad->dev);
+        }
+        if (!timer_home_running)
+        {
+            timer_setup(&timer_home, handle_timeout_home, 0);
+            mod_timer(&timer_home, jiffies + msecs_to_jiffies(BTN_TIMER_TIMEOUT_MS));
+            spin_lock(&home_btn_lock);
+            timer_home_running = true;
+            spin_unlock(&home_btn_lock);
+        }
+    } else if (scancode == (SCANCODE_KEY_WIN | SCANCODE_KEY_RELEASED))
+    {
+        spin_lock(&kbd_btn_lock);
+        kbd_btn_state |= SCANCODE_KEY_WIN_MSK;
+        spin_unlock(&kbd_btn_lock);
+        if ((kbd_btn_state & SCANCODE_BTN_KBD_MSK) == SCANCODE_BTN_KBD_MSK)
+        {
+            input_report_key(win_key_xpad->dev, BTN_X, 1);
+            input_sync(win_key_xpad->dev);
+            printk("X pressed\n");
+        }
+        if (!timer_kbd_running)
+        {
+            timer_setup(&timer_kbd_x, handle_timeout_kbd_x, 0);
+            mod_timer(&timer_kbd_x, jiffies + msecs_to_jiffies(BTN_TIMER_TIMEOUT_MS));
+            spin_lock(&kbd_btn_lock);
+            timer_kbd_running = true;
+            spin_unlock(&kbd_btn_lock);
+        }
+    } else if (scancode == (SCANCODE_KEY_LCTL | SCANCODE_KEY_RELEASED))
+    {
+        spin_lock(&kbd_btn_lock);
+        kbd_btn_state |= SCANCODE_KEY_LCTL_MSK;
+        spin_unlock(&kbd_btn_lock);
+
+        if ((kbd_btn_state & SCANCODE_BTN_KBD_MSK) == SCANCODE_BTN_KBD_MSK)
+        {
+            input_report_key(win_key_xpad->dev, BTN_X, 1);
+            input_sync(win_key_xpad->dev);
+            printk("X pressed\n");
+        }
+        if (!timer_kbd_running)
+        {
+            timer_setup(&timer_kbd_x, handle_timeout_kbd_x, 0);
+            mod_timer(&timer_kbd_x, jiffies + msecs_to_jiffies(BTN_TIMER_TIMEOUT_MS));
+            spin_lock(&kbd_btn_lock);
+            timer_kbd_running = true;
+            spin_unlock(&kbd_btn_lock);
+        }
+    } else if (scancode == (SCANCODE_KEY_O | SCANCODE_KEY_RELEASED))
+    {
+        spin_lock(&kbd_btn_lock);
+        kbd_btn_state |= SCANCODE_KEY_O_MSK;
+        spin_unlock(&kbd_btn_lock);
+
+        if ((kbd_btn_state & SCANCODE_BTN_KBD_MSK) == SCANCODE_BTN_KBD_MSK)
+        {
+            input_report_key(win_key_xpad->dev, BTN_X, 1);
+            input_sync(win_key_xpad->dev);
+            printk("X pressed\n");
+        }
+        if (!timer_kbd_running)
+        {
+            timer_setup(&timer_kbd_x, handle_timeout_kbd_x, 0);
+            mod_timer(&timer_kbd_x, jiffies + msecs_to_jiffies(BTN_TIMER_TIMEOUT_MS));
+            spin_lock(&kbd_btn_lock);
+            timer_kbd_running = true;
+            spin_unlock(&kbd_btn_lock);
+        }
+    }
     return IRQ_HANDLED;
 }	//luali
+/* */
 
 static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
@@ -1905,7 +2091,10 @@ err_free_mem:
 
 static void xpad_disconnect(struct usb_interface *intf)
 {
-
+    del_timer(&timer_home); // elveman
+    del_timer(&timer_kbd_x); // elveman
+    del_timer(&timer_kbd_home); // elveman
+    del_timer(&timer_kbd_cpl); //elveman
 	free_irq(1,(void *)(win_key_irq_handler));	//luali
 
 	struct usb_xpad *xpad = usb_get_intfdata(intf);

@@ -13,4 +13,9 @@ reboot
 
 Completed:
 
-The Win key maps to the Home key of the xbox controller.
+The IRQ now checks for a specific keycombo to invoke Home menu
+The IRQ now checks for a specific keycombo *and* launches a complicated system of timers to invoke the on-screen keyboard (still unstable)
+
+Todo:
+
+Fix the deadlock while unloading the module
